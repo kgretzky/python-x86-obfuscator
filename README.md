@@ -27,17 +27,17 @@ optional arguments:
                         0-184,188-204)
 ```
 
-Example 1:
+**Example 1:**
 ```
 python x86obf.py -i shellcode\test1.bin -o output.bin
 ```
 
-Example 2:
+**Example 2:**
 ```
 python x86obf.py -i shellcode\exec_calc.bin -o output.bin -r 0-184
 ```
 
-Example 3:
+**Example 3:**
 ```
 python x86obf.py -i shellcode\msg_box.bin -o output.bin -r 0-196
 ```
