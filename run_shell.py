@@ -10,7 +10,7 @@ def parse_args():
 def main():
   args = parse_args()
 
-  with open(args.input, 'r') as f:
+  with open(args.input, 'rb') as f:
     shbin = f.read()
 
   shellcode = bytearray()

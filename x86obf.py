@@ -15,6 +15,11 @@ R_EBP = 5
 R_ESI = 6
 R_EDI = 7
 
+# globals
+
+conf_min_steps = 1
+conf_max_steps = 5
+
 # classes
 
 class _instr:
@@ -26,17 +31,6 @@ class _instr:
 		self.is_data = is_data
 
 # functions
-
-def print_string_hex(str):
-	for c in str:
-		print "%02x" % ord(c),
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--input", help="Input binary shellcode file", default='', required=True)
-    parser.add_argument("-o", "--output", help="Output obfuscated binary shellcode file", default='', required=True)
-    parser.add_argument("-r", "--range", help="Ranges where code instructions reside (e.g. 0-184,188-204)", default='')
-    return parser.parse_args()
 
 def is_rel_jmp(bytes):
 	if len(bytes) >= 2:
@@ -73,6 +67,37 @@ def get_jmp_delta(bytes):
 		else:
 			return d
 	return 0
+	
+def get_signed_int(imm, nbytes):
+	if nbytes == 1:
+		d = imm
+		if d >= 0x80:
+			return (0x100-d)*(-1)
+		else:
+			return d
+	elif nbytes == 2:
+		d = imm
+		if d >= 0x8000:
+			return (0x10000-d)*(-1)
+		else:
+			return d		
+	elif nbytes == 4:
+		d = imm
+		if d >= 0x80000000:
+			return (0x100000000-d)*(-1)
+		else:
+			return d
+	raise	
+	
+def get_rand_reg(exclude_regs):
+	regs = range(R_EAX, R_EDI+1)
+	for r in exclude_regs:
+		if r in regs:
+			regs.remove(r)
+	if len(regs) > 0:
+		return random.choice(regs)
+	else:
+		return -1
 
 def mod_jmp_delta(bytes, delta):
 	ret_bytes = ''
@@ -127,6 +152,65 @@ def mod_jmp_delta(bytes, delta):
 
 	return ret_bytes
 
+# parses the instruction bytes and divides them into sections
+def parse_instr_bytes(bytes):
+	prefix = opcode = modrm = sib = disp = imm = ''
+	sib_bytes = 0
+	disp_bytes = 0
+	
+	# prefix
+	fl = 0
+	for b in bytes:
+		if ord(b) in [0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0x67, 0x9b, 0xf0, 0xf1, 0xf2, 0xf3]:
+			prefix += b
+			fl += 1
+		else:
+			break
+			
+	# opcode
+	if ord(bytes[fl]) == 0x0f: # 2 byte opcode
+		opcode = bytes[fl:fl+1]
+		fl += 2
+	else:
+		opcode = bytes[fl]
+		fl += 1
+		
+	# modrm
+	modrm = bytes[fl]
+	fl += 1
+	
+	mod = (ord(modrm) & 0xc0) >> 6
+	rm = (ord(modrm) & 0x07)
+	if mod==0:
+		if rm==0x05: # 32-bit displacement only
+			disp_bytes = 4
+	elif mod==1:
+		disp_bytes = 1 # disp8
+	elif mod==2:
+		disp_bytes = 4 # disp32
+
+	if rm==0x04:
+		sib_bytes = 1
+		
+	#print 'sib_bytes:', sib_bytes
+	#print 'disp_bytes:', disp_bytes
+	
+	# sib	
+	if sib_bytes == 1:
+		sib = bytes[fl]
+		fl += 1
+	
+	# disp
+	if disp_bytes > 0:
+		disp = bytes[fl:fl+disp_bytes]
+		fl += disp_bytes
+	
+	# imm
+	imm = bytes[fl:]
+	
+	return prefix, opcode, modrm, sib, disp, imm
+
+# mov reg, imm
 def obf_gen_mov_reg_imm(reg, imm, nbytes):
 	ret_bytes = ''
 	if nbytes == 1:
@@ -144,6 +228,65 @@ def obf_gen_mov_reg_imm(reg, imm, nbytes):
 	elif nbytes == 4:
 		ret_bytes += struct.pack('<I', imm)
 	return ret_bytes
+	
+# push reg
+def obf_gen_push_reg(reg):
+	ret_bytes = ''
+	opcode = 0x50 # push reg
+	ret_bytes += chr(opcode + reg)
+	return ret_bytes
+
+# pop reg
+def obf_gen_pop_reg(reg):
+	ret_bytes = ''
+	opcode = 0x58 # pop reg
+	ret_bytes += chr(opcode + reg)
+	return ret_bytes
+
+# mov reg, [reg+reg]
+def obf_gen_mov_reg_reg_disp(reg_dst, reg_src, reg_disp, reg_bytes, prefix):
+	ret_bytes = ''
+	if reg_bytes==1:
+		opcode = 0x8a # mov r8, [reg+reg]
+	else:
+		opcode = 0x8b # mov r32, [reg+reg]
+	modrm = (reg_dst << 3) + 0x04 # sib mode
+	sib = reg_src + (reg_disp << 3)
+	if reg_bytes == 2:
+		ret_bytes += chr(0x66)
+	if prefix > 0:
+		ret_bytes += chr(prefix)
+	ret_bytes += chr(opcode) + chr(modrm) + chr(sib)
+	return ret_bytes
+	
+# mov reg, [reg*X+reg]
+def obf_gen_lea_reg_sib_reg(reg_dst, sib_base, sib_index, sib_scale):
+	ret_bytes = ''
+	opcode = 0x8d # lea r32, mem
+	modrm = (reg_dst << 3) + 0x04 # sib mode
+	sib = sib_base + (sib_index << 3) + (sib_scale << 6)
+	ret_bytes += chr(opcode) + chr(modrm) + chr(sib)
+	return ret_bytes
+
+# mov [esp+disp], reg
+def obf_gen_mov_esp_disp_reg(disp, reg_src):
+	ret_bytes = ''
+	opcode = 0x89 # mov mem, reg
+	if -128 <= disp <= 127:
+		nbytes = 1
+		modrm = 0x01 << 6
+	else:
+		nbytes = 4
+		modrm = 0x02 << 6
+	modrm += (reg_src << 3) + 0x04 # sib mode
+	sib = (R_ESP << 3) + R_ESP # [esp]
+	
+	ret_bytes += chr(opcode) + chr(modrm) + chr(sib)
+	if nbytes == 1:
+		ret_bytes += chr(disp)
+	elif nbytes == 4:
+		ret_bytes += struct.pack('<I', disp)
+	return ret_bytes 
 
 def obf_gen_calc_reg_imm(name, reg, imm, nbytes):
 	ret_bytes = ''
@@ -175,6 +318,9 @@ def obf_gen_reg_calc(reg, imm, steps, nbytes):
 	ret = []
 	cimm = imm
 	calc = []
+
+	if steps == 0:
+		return cimm, ret
 
 	if nbytes == 1:
 		mask = 0xff
@@ -229,34 +375,264 @@ def obf_mov_reg_imm(sl, ni):
 		nbytes = 4
 	#print 'imm:', imm
 
-	cimm, il = obf_gen_reg_calc(reg, imm, random.randint(1,5), nbytes)
+	cimm, il = obf_gen_reg_calc(reg, imm, random.randint(conf_min_steps, conf_max_steps), nbytes)
 	lbl = i.label
 
 	shell_delete_bytes(sl, ni)
 	shell_insert_bytes(sl, ni, obf_gen_mov_reg_imm(reg, cimm, nbytes), lbl)
 	of = ni+1
+	iadd = 0
 	for l in il:
 		shell_insert_bytes(sl, of, l)
-		lbl = -1
 		of += 1
+		iadd += 1
+	iadd += 1
+	return iadd
+
+def obf_mov_reg_reg_imm_disp(sl, ni):
+	disp = reg_dst = reg_dst = reg_index = reg_scale = disp_bytes = -1
+	
+	i = sl[ni]
+	
+	reg_bytes = 4
+	prefix = 0
+	
+	fl = 0
+	if ord(i.bytes[fl]) == 0x66:
+		reg_bytes = 2
+		fl += 1
+	if ord(i.bytes[fl]) in [0x64, 0x26, 0x2e, 0x36, 0x3e, 0x65, 0xf0, 0xf2, 0xf3]: # known prefixes
+		prefix = ord(i.bytes[fl])
+		fl += 1
+	if ord(i.bytes[fl]) == 0x8a:
+		reg_bytes = 1
+	
+	modrm = ord(i.bytes[fl+1])
+	mod = (modrm & 0xc0)
+	if mod == 0x80:
+		disp_bytes = 4
+	elif mod == 0x40:
+		disp_bytes = 1
+	else:
+		raise
+	
+	reg_dst = (modrm & 0x38) >> 3
+	if modrm & 0x07 == 0x04: # sib present
+		sib = ord(i.bytes[fl+2])
+		reg_src = (sib & 0x07)
+		reg_index = (sib & 0x38) >> 3
+		reg_scale = (sib & 0xc0) >> 6
+		if disp_bytes == 1:
+			disp = get_signed_int(ord(i.bytes[fl+3]), 1)
+		elif disp_bytes == 4:
+			disp = int(i.bytes[fl+3:fl+3+4][::-1].encode('hex'), 16)
+	else:
+		reg_src = (modrm & 0x07)
+		if disp_bytes == 1:
+			disp = get_signed_int(ord(i.bytes[fl+2]), 1)
+		elif disp_bytes == 4:
+			disp = int(i.bytes[fl+2:fl+2+4][::-1].encode('hex'), 16)
+			
+	#print 'reg_dst:', reg_dst, 'reg_src:', reg_src, 'disp:', disp, 'reg_index:', reg_index, 'reg_scale:', reg_scale
+		
+	exc_regs = [reg_dst, reg_src, R_ESP, R_EBP]
+	if reg_index >= 0:
+		exc_regs.append(reg_index)
+		
+	treg = get_rand_reg(exc_regs)
+	#print 'treg:', treg
+	if treg == -1:
+		raise
+
+	cimm, il = obf_gen_reg_calc(treg, disp, random.randint(conf_min_steps, conf_max_steps), 4)
+	lbl = i.label
+	
+	shell_delete_bytes(sl, ni)
+	shell_insert_bytes(sl, ni, obf_gen_push_reg(treg), lbl)
+	
+	shell_insert_bytes(sl, ni+1, obf_gen_mov_reg_imm(treg, cimm, 4))
+	iadd = 1
+	of = ni+2
+	for l in il:
+		shell_insert_bytes(sl, of, l)
+		of += 1
+		iadd += 1
+	
+	if reg_index >= 0 and reg_scale >= 0:
+		shell_insert_bytes(sl, of, obf_gen_lea_reg_sib_reg(treg, treg, reg_index, reg_scale))
+		of += 1
+		iadd += 1
+	shell_insert_bytes(sl, of, obf_gen_mov_reg_reg_disp(reg_dst, reg_src, treg, reg_bytes, prefix))
+	shell_insert_bytes(sl, of+1, obf_gen_pop_reg(treg))
+	iadd += 2
+	iadd += 1
+	return iadd
+	
+def obf_push_imm(sl, ni):
+	imm = 0
+	i = sl[ni]
+	
+	if ord(i.bytes[0]) == 0x6a: # push imm8
+		imm = ord(i.bytes[1])
+	elif ord(i.bytes[0]) == 0x68: # push imm32
+		imm = int(i.bytes[1:1+4][::-1].encode('hex'), 16)
+		
+	exc_regs = [R_ESP, R_EBP]
+	treg = get_rand_reg(exc_regs)
+
+	cimm, il = obf_gen_reg_calc(treg, imm, random.randint(conf_min_steps, conf_max_steps), 4)
+	lbl = i.label
+	
+	shell_delete_bytes(sl, ni)
+	shell_insert_bytes(sl, ni, obf_gen_push_reg(get_rand_reg([])), lbl)
+	shell_insert_bytes(sl, ni+1, obf_gen_push_reg(treg), lbl)
+
+	shell_insert_bytes(sl, ni+2, obf_gen_mov_reg_imm(treg, cimm, 4))
+	iadd = 2	
+	of = ni+3
+	for l in il:
+		shell_insert_bytes(sl, of, l)
+		of += 1
+		iadd += 1
+
+	shell_insert_bytes(sl, of, obf_gen_mov_esp_disp_reg(4, treg))
+	shell_insert_bytes(sl, of+1, obf_gen_pop_reg(treg))
+	iadd += 2
+	iadd += 1
+	return iadd
+
+def obf_oper_reg_imm(sl, ni):
+	imm = 0
+	iadd = 0
+	i = sl[ni]
+	
+	_prefix, _opcode, _modrm, _sib, _disp, _imm = parse_instr_bytes(i.bytes)
+	
+	exc_regs = [R_ESP, R_EBP]
+	if len(_imm) == 1:
+		exc_regs.append(R_ESI)
+		exc_regs.append(R_EDI)
+		
+	if len(_sib) > 0:
+		exc_regs.append((ord(_sib) & 0x38) >> 3)
+		exc_regs.append(ord(_sib) & 0x07)
+	else:
+		exc_regs.append(ord(_modrm) & 0x07)
+	
+	treg = get_rand_reg(exc_regs)
+
+	opcode = ord(_opcode)
+	mode = (ord(_modrm) & 0x38) >> 3
+
+	if len(_imm) > 0:
+		if len(_imm) == 1:
+			if opcode == 0x80:
+				imm = ord(_imm)
+			elif opcode in [0x82, 0x83]:
+				imm = get_signed_int(ord(_imm), 1)
+			else:
+				raise
+		else:
+			imm = int(_imm[::-1].encode('hex'), 16)
+		
+		cimm, il = obf_gen_reg_calc(treg, imm, random.randint(conf_min_steps, conf_max_steps), 4)
+		lbl = i.label
+		
+		shell_delete_bytes(sl, ni)
+		shell_insert_bytes(sl, ni, obf_gen_push_reg(treg), lbl)
+		
+		shell_insert_bytes(sl, ni+1, obf_gen_mov_reg_imm(treg, cimm, 4))
+		iadd = 1
+		of = ni+2
+		for l in il:
+			shell_insert_bytes(sl, of, l)
+			of += 1
+			iadd += 1
+			
+		nopcode = 0
+		if mode == 0: # add
+			if opcode in [0x80, 0x82]:
+				nopcode = 0x00
+			elif opcode in [0x81, 0x83]:
+				nopcode = 0x01
+		elif mode == 1: # or
+			if opcode in [0x80, 0x82]:
+				nopcode = 0x08
+			elif opcode in [0x81, 0x83]:
+				nopcode = 0x09
+		elif mode == 2: # adc
+			if opcode in [0x80, 0x82]:
+				nopcode = 0x10
+			elif opcode in [0x81, 0x83]:
+				nopcode = 0x11
+		elif mode == 3: # sbb
+			if opcode in [0x80, 0x82]:
+				nopcode = 0x18
+			elif opcode in [0x81, 0x83]:
+				nopcode = 0x19
+		elif mode == 4: # and
+			if opcode in [0x80, 0x82]:
+				nopcode = 0x20
+			elif opcode in [0x81, 0x83]:
+				nopcode = 0x21
+		elif mode == 5: # sub
+			if opcode in [0x80, 0x82]:
+				nopcode = 0x28
+			elif opcode in [0x81, 0x83]:
+				nopcode = 0x29
+		elif mode == 6: # xor
+			if opcode in [0x80, 0x82]:
+				nopcode = 0x30
+			elif opcode in [0x81, 0x83]:
+				nopcode = 0x31
+		elif mode == 7: # cmp
+			if opcode in [0x80, 0x82]:
+				nopcode = 0x38
+			elif opcode in [0x81, 0x83]:
+				nopcode = 0x39
+				
+		nmodrm = (ord(_modrm) & 0xc7) | (treg << 3)
+		ninstr = _prefix + chr(nopcode) + chr(nmodrm) + _sib + _disp
+		shell_insert_bytes(sl, of, ninstr)
+
+		shell_insert_bytes(sl, of+1, obf_gen_pop_reg(treg))
+		iadd += 2
+		iadd += 1
+
+	return iadd
 
 def obf_instr(sl, ni):
 	i = sl[ni]
 	fi = 0
-	if ord(i.bytes[0]) == 0x66: # 16bit
-		fi = 1
+	iadd = 0
+	for b in i.bytes[fi]:
+		if ord(b) in [0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65, 0x66, 0x67, 0x9b, 0xf0, 0xf1, 0xf2, 0xf3]: # known prefixes
+			fi += 1
+		else:
+			break
 
 	if ord(i.bytes[fi]) >= 0xb0 and ord(i.bytes[fi]) <= 0xbf: # mov reg, imm
-		print 'mov reg,imm:', ni
-		obf_mov_reg_imm(sl, ni)
-	if ord(i.bytes[fi]) == 0x6a or ord(i.bytes[fi]) == 0x68: # push imm
-		print 'push imm:', ni
+		#print 'mov reg,imm:', ni
+		iadd = obf_mov_reg_imm(sl, ni)
+	elif ord(i.bytes[fi]) == 0x6a or ord(i.bytes[fi]) == 0x68: # push imm
+		#print 'push imm:', ni
+		iadd = obf_push_imm(sl, ni)
+	elif (ord(i.bytes[fi]) == 0x8b or ord(i.bytes[fi]) == 0x8a) and (ord(i.bytes[fi+1]) & 0xC0) in [0x40, 0x80]: # mov reg, [reg+disp]
+		#print 'mov reg, [reg+disp]:', ni
+		iadd = obf_mov_reg_reg_imm_disp(sl, ni)
+	elif ord(i.bytes[fi]) in [0x80, 0x81, 0x82, 0x83]: # <add, or, adc, sbb, and, sub, xor, cmp> reg, imm
+		#print '<add/or/adc/sbb/and/sub/xor/cmp> reg, imm:', ni
+		iadd = obf_oper_reg_imm(sl, ni)
+	return iadd
 
 def do_obfuscate(sl):
 	ni = 0
+	iadd = 0
 	for i in sl:
-		if i.is_data==0:
-			obf_instr(sl, ni)
+		if iadd==0 and i.is_data==0:
+			iadd += obf_instr(sl, ni) # iadd will receive the number of added instructions that we need to skip afterwards 
+		if iadd>0:
+			iadd -= 1
 		ni += 1	
 
 def get_instr_i_by_offset(sl, offset):
@@ -345,10 +721,6 @@ def fix_shell(sl):
 
 				shell_delete_bytes(sl, ni)
 
-				#jlab = -1
-				#if len(sl) > ni:
-				#	jlab = sl[ni].label
-				#if jlab == -1: jlab = nextl+1
 				jlab = nextl+1
 
 				shell_insert_bytes(sl, ni, '\x75\x00', li, nextl)
@@ -357,8 +729,6 @@ def fix_shell(sl):
 				shell_insert_bytes(sl, ni+3, '\xe9\x00\x00\x00\x00', -1, jmpi)
 				shell_insert_bytes(sl, ni+4, '\x49', nextl)
 				shell_insert_bytes(sl, ni+5, '\x90', jlab)
-
-				#sl[ni+5].label = jlab
 
 				fix_jmp(sl, ni)
 				fix_jmp(sl, ni+2)
@@ -509,23 +879,37 @@ def print_debug(sl):
 		print ''
 		offset += i.size
 
+def print_string_hex(str):
+	for c in str:
+		print "%02x" % ord(c),
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-i", "--input", help="Input binary shellcode file", default='', required=True)
+    parser.add_argument("-o", "--output", help="Output obfuscated binary shellcode file", default='', required=True)
+    parser.add_argument("-r", "--range", help="Ranges where code instructions reside (e.g. 0-184,188-204)", default='')
+    parser.add_argument("-p", "--passes", help="How many passes should the process go through (def. 1)", default=1, type=int)
+    return parser.parse_args()
 
 def main():
 	args = parse_args()
 
-	with open(args.input, 'r') as f:
+	with open(args.input, 'rb') as f:
 		shbin = f.read()
 
 	sl = load_shell(shbin, args.range)
 	print_disasm(sl)
 	fix_shell(sl)
-	do_obfuscate(sl)
+	print ''
+	for i in range(1,args.passes+1):
+		print 'Obfuscation pass:', i
+		do_obfuscate(sl)
 
 	print ''
 	print_disasm(sl)
 
 	obin = write_shell(sl)
-	with open(args.output, 'w') as f:
+	with open(args.output, 'wb') as f:
 		f.write(obin)
 
 if __name__ == '__main__':
