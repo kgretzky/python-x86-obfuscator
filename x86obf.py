@@ -485,7 +485,7 @@ def obf_push_imm(sl, ni):
 	
 	shell_delete_bytes(sl, ni)
 	shell_insert_bytes(sl, ni, obf_gen_push_reg(get_rand_reg([])), lbl)
-	shell_insert_bytes(sl, ni+1, obf_gen_push_reg(treg), lbl)
+	shell_insert_bytes(sl, ni+1, obf_gen_push_reg(treg))
 
 	shell_insert_bytes(sl, ni+2, obf_gen_mov_reg_imm(treg, cimm, 4))
 	iadd = 2	
@@ -633,7 +633,58 @@ def do_obfuscate(sl):
 			iadd += obf_instr(sl, ni) # iadd will receive the number of added instructions that we need to skip afterwards 
 		if iadd>0:
 			iadd -= 1
-		ni += 1	
+		ni += 1
+
+def insert_bad_byte(sl, ni):
+	bb = random.choice([0x68, 0x81, 0x83, 0xe8, 0xe9, 0xea, 0xd8, 0xd9, 0xda, 0xdc, 0xde, 0xf7])
+	shell_insert_data(sl, ni, chr(bb)) 
+
+def do_mangle_flow(sl, level):
+	ret = []
+	ni = 0
+	ki = 0
+	jmps = 0
+	jlab = get_next_label(sl)
+	for i in sl:
+		if i.is_data==0:
+			if len(ret)>0 and random.randint(0,10) <= level:
+				# do jump
+				to_label = i.label
+				if to_label == -1:
+					to_label = jlab
+					jlab += 1
+				shell_insert_bytes(ret, ki, '\xeb\x00', -1, to_label)
+				insert_bad_byte(ret, ki+1)
+
+				ki = random.randint(0,len(ret)-1)
+				while ki<len(ret) and ret[ki].is_data==1: # make sure to not inject jumps where data resides
+					ki = random.randint(0,len(ret))
+
+				jmp_label = -1
+				ji = ki
+				if ki < len(ret):
+					jmp_label = ret[ji].label
+				if jmp_label == -1:
+					jmp_label = jlab
+					if ji < len(ret):
+						ret[ji].label = jlab
+					jlab += 1
+				shell_insert_bytes(ret, ki, '\xeb\x00', -1, jmp_label)
+				shell_insert_bytes(ret, ki+1, i.bytes, to_label, i.jmp_label)
+				ki += 2
+				jmps += 1
+			else:
+				# no jump, just insert an instruction at current position
+				shell_insert_bytes(ret, ki, i.bytes, i.label, i.jmp_label)
+				ki += 1
+		else:
+			shell_insert_data(ret, ki, i.bytes)
+			ki += 1
+
+	for ni in range(0,len(ret)-1):
+		recalc_jmps(ret, ni)
+
+	return ret
 
 def get_instr_i_by_offset(sl, offset):
 	off = 0
@@ -749,6 +800,11 @@ def shell_insert_bytes(sl, ni, bytes, label = -1, jmp_label = -1):
 		tsize += size
 	recalc_jmps(sl, ni)
 
+def shell_insert_data(sl, ni, bytes):
+	i = _instr(bytes[:], len(bytes), 1)
+	sl.insert(ni, i)
+	recalc_jmps(sl, ni)
+
 def shell_replace_bytes(sl, ni, bytes, label = -1, jmp_label = -1):
 	i = sl[ni]
 	i.bytes = bytes
@@ -808,7 +864,6 @@ def load_shell(bin, range):
 			rr = r.split('-')
 			br = int(rr[0])
 			er = int(rr[1])
-			#print 'from', int(rr[0]), 'to', int(rr[1])
 			if br > cr:
 				rbin.append( bin[cr:br] )
 				ibin.append(1)
@@ -827,7 +882,6 @@ def load_shell(bin, range):
 
 	i=0
 	for t in rbin:
-		#print len(t), ':', ibin[i]
 		i+=1
 
 	i=0
@@ -855,6 +909,8 @@ def print_disasm(sl):
 	ioff = 0
 	for i in sl:
 		if i.is_data == 0:
+			#if i.label >= 0 or i.jmp_label >= 0:
+			#	print 'label:', i.label, 'jmp_label:', i.jmp_label
 			l = distorm3.Decode(ioff, i.bytes, distorm3.Decode32Bits)
 			for (offset, size, instr, hexdump) in l:
 				print '%-4i %.8x: %-32s %s' % (ni, offset, hexdump, instr)
@@ -884,12 +940,13 @@ def print_string_hex(str):
 		print "%02x" % ord(c),
 
 def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--input", help="Input binary shellcode file", default='', required=True)
-    parser.add_argument("-o", "--output", help="Output obfuscated binary shellcode file", default='', required=True)
-    parser.add_argument("-r", "--range", help="Ranges where code instructions reside (e.g. 0-184,188-204)", default='')
-    parser.add_argument("-p", "--passes", help="How many passes should the process go through (def. 1)", default=1, type=int)
-    return parser.parse_args()
+	parser = argparse.ArgumentParser()
+	parser.add_argument("-i", "--input", help="Input binary shellcode file", default='', required=True)
+	parser.add_argument("-o", "--output", help="Output obfuscated binary shellcode file", default='', required=True)
+	parser.add_argument("-r", "--range", help="Ranges where code instructions reside (e.g. 0-184,188-204)", default='')
+	parser.add_argument("-p", "--passes", help="How many passes should the obfuscation process go through (def. 1)", default=1, type=int)
+	parser.add_argument("-f", "--mixflow", help="Specify level of execution flow mixing (0-10) (def. 5)", default=5, type=int)
+	return parser.parse_args()
 
 def main():
 	args = parse_args()
@@ -904,6 +961,9 @@ def main():
 	for i in range(1,args.passes+1):
 		print 'Obfuscation pass:', i
 		do_obfuscate(sl)
+	
+	if args.mixflow > 0:
+		sl = do_mangle_flow(sl, args.mixflow)
 
 	print ''
 	print_disasm(sl)
